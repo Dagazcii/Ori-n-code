@@ -688,44 +688,207 @@ def html_to_text(html):
         return re.sub(r"<[^>]+>", " ", html)
 
 
+
+def _search_roots() -> list:
+    """Directories where @path may resolve."""
+    roots = []
+    seen = set()
+    candidates = [
+        Path.cwd(),
+        Path.home(),
+        Path.home() / "storage" / "shared",
+        Path.home() / "storage" / "downloads",
+        Path.home() / "storage" / "documents",
+        Path("/storage/emulated/0"),
+        Path("/storage/emulated/0/Download"),
+        Path("/storage/emulated/0/Documents"),
+        Path("/sdcard"),
+        Path("/sdcard/Download"),
+    ]
+    for c in candidates:
+        try:
+            r = c.expanduser().resolve()
+            if r.is_dir() and str(r) not in seen:
+                seen.add(str(r))
+                roots.append(r)
+        except Exception:
+            continue
+    return roots
+
+
+def _looks_like_path(name: str) -> bool:
+    return bool(re.search(r"[/\\.]|~", name)) or name.startswith(".")
+
+
+def _find_by_name(name: str, roots: list, max_hits: int = 8) -> list:
+    """Find files/dirs named name under roots (depth-limited)."""
+    name_l = name.lower().rstrip("/")
+    hits = []
+    skip = _IGNORE_DIRS | {"Android", "DCIM", "Alarms", "Notifications", "Ringtones"}
+    for root in roots:
+        try:
+            # direct child
+            direct = root / name
+            if direct.exists():
+                hits.append(direct.resolve())
+            # case-insensitive children
+            try:
+                for child in root.iterdir():
+                    if child.name.lower() == name_l:
+                        hits.append(child.resolve())
+            except Exception:
+                pass
+        except Exception:
+            pass
+    # shallow walk (depth 1-3) if still few hits
+    if len(hits) < 2:
+        for root in roots[:6]:
+            try:
+                for dirpath, dirnames, filenames in os.walk(root):
+                    depth = Path(dirpath).relative_to(root).parts
+                    if len(depth) > 3:
+                        dirnames[:] = []
+                        continue
+                    dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+                    base = Path(dirpath)
+                    for d in list(dirnames):
+                        if d.lower() == name_l or name_l in d.lower():
+                            hits.append((base / d).resolve())
+                    for f in filenames:
+                        if f.lower() == name_l or (
+                            len(name_l) > 2 and name_l in f.lower()
+                        ):
+                            hits.append((base / f).resolve())
+                    if len(hits) >= max_hits:
+                        break
+            except Exception:
+                continue
+            if len(hits) >= max_hits:
+                break
+    # unique preserve order
+    out = []
+    seen = set()
+    for h in hits:
+        s = str(h)
+        if s not in seen:
+            seen.add(s)
+            out.append(h)
+    return out[:max_hits]
+
+
+def _format_dir_listing(path: Path, max_entries: int = 40) -> str:
+    lines = [f"[directory] {path}"]
+    try:
+        entries = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        for e in entries[:max_entries]:
+            lines.append(("  [DIR] " if e.is_dir() else "  ") + e.name)
+        if len(entries) > max_entries:
+            lines.append(f"  ... ({len(entries) - max_entries} more)")
+    except Exception as ex:
+        lines.append(f"  (cannot list: {ex})")
+    # include short README if present
+    for n in ("README.md", "ORION.md", "package.json"):
+        fp = path / n
+        if fp.is_file() and fp.stat().st_size < 40_000:
+            try:
+                lines.append(
+                    f"\n--- {n} ---\n"
+                    + fp.read_text(encoding="utf-8", errors="replace")[:1500]
+                )
+            except Exception:
+                pass
+    return "\n".join(lines)
+
+
+def _format_file(path: Path, max_file_chars: int) -> str:
+    try:
+        if path.stat().st_size > 400_000:
+            return f"[file too large] {path} ({path.stat().st_size} bytes)"
+        body = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as ex:
+        return f"[read error] {path}: {ex}"
+    if len(body) > max_file_chars:
+        body = body[:max_file_chars] + "\n...[truncated]"
+    return f"--- file: {path} ---\n{body}\n--- end ---"
+
+
 def expand_at_mentions(text: str, max_file_chars: int = 12000) -> str:
+    """
+    Expand @path, @folder, @name mentions.
+    Searches cwd, home, and phone storage — not only Termux $HOME.
+    """
     if not text or "@" not in text:
         return text
-    pattern = re.compile(r"@([~/]?[\w./\-]+)")
+    # @foo, @foo/bar, @~/x, @./x, @"path with spaces" (simple)
+    pattern = re.compile(r"@(\"[^\"]+\"|'[^']+'|[~/.\w\-]+(?:/[~\w.\-]+)*)")
+    roots = _search_roots()
     seen = set()
     chunks = []
 
+    def resolve_one(raw: str) -> str:
+        raw = raw.strip().strip("\"'")
+        if not raw or raw in seen:
+            return ""
+        seen.add(raw)
+
+        # absolute / home / relative to cwd
+        candidates = []
+        p = Path(raw).expanduser()
+        try:
+            if p.is_absolute() and p.exists():
+                candidates.append(p.resolve())
+        except Exception:
+            pass
+        try:
+            rel = (Path.cwd() / raw).resolve()
+            if rel.exists():
+                candidates.append(rel)
+        except Exception:
+            pass
+        # search by basename across roots
+        base = Path(raw).name
+        found = _find_by_name(base, roots)
+        for f in found:
+            if f not in candidates:
+                candidates.append(f)
+        # also try full relative under each root
+        for root in roots:
+            try:
+                q = (root / raw).resolve()
+                if q.exists() and q not in candidates:
+                    candidates.append(q)
+            except Exception:
+                pass
+
+        if not candidates:
+            return f"[not found: @{raw} — searched cwd, home, storage]"
+
+        # if multiple, list them and attach the best (prefer cwd, then file match exact)
+        if len(candidates) > 1:
+            exact = [c for c in candidates if c.name.lower() == base.lower()]
+            pick = exact[0] if exact else candidates[0]
+            alt = "\n".join(f"  - {c}" for c in candidates[:6])
+            header = f"[resolved @{raw} -> {pick}]\n[other matches:\n{alt}\n]"
+        else:
+            pick = candidates[0]
+            header = f"[resolved @{raw} -> {pick}]"
+
+        if pick.is_dir():
+            return header + "\n" + _format_dir_listing(pick)
+        if pick.is_file():
+            return header + "\n" + _format_file(pick, max_file_chars)
+        return f"[not a file/dir: {pick}]"
+
     def repl(m):
         raw = m.group(1)
-        if raw in seen:
-            return m.group(0)
-        seen.add(raw)
-        path = Path(raw).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        try:
-            path = path.resolve()
-        except Exception:
-            return m.group(0)
-        if not path.is_file():
-            chunks.append(f"[file not found: {raw}]")
-            return m.group(0)
-        try:
-            if path.stat().st_size > 400_000:
-                chunks.append(f"[file too large: {path.name}]")
-                return m.group(0)
-            body = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as ex:
-            chunks.append(f"[read error {raw}: {ex}]")
-            return m.group(0)
-        if len(body) > max_file_chars:
-            body = body[:max_file_chars] + "\n...[truncated]"
-        chunks.append(f"\n--- {path} ---\n{body}\n--- end ---\n")
+        block = resolve_one(raw)
+        if block:
+            chunks.append(block)
         return m.group(0)
 
     new_text = pattern.sub(repl, text)
     if chunks:
-        new_text = new_text + "\n" + "\n".join(chunks)
+        new_text = new_text + "\n\n" + "\n\n".join(chunks)
     return new_text
 
 
@@ -829,11 +992,44 @@ def tool_write_file(path, content):
         return f"Error: {e}"
 
 
+def _git_safety_check(command: str) -> str | None:
+    """Block risky git usage (HOME repo, secrets)."""
+    low = command.lower().strip()
+    if not low.startswith("git ") and " git " not in f" {low} ":
+        # still catch pure git ...
+        if not re.match(r"^git\b", low):
+            return None
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    # git init/add/commit/push from HOME is almost always wrong
+    if cwd == home or cwd == home / "storage" or str(cwd).endswith("/storage/shared"):
+        if re.search(r"\bgit\s+(init|add|commit|push|remote)\b", low):
+            return (
+                "Blocked: git write operations from HOME/shared root. "
+                "cd into the project folder first (e.g. cd ~/storage/shared/orion-code)."
+            )
+    # never add secrets
+    if re.search(r"\bgit\s+add\b", low):
+        banned = (
+            ".env", ".ssh", ".gitconfig", ".bash_history", "id_rsa", "id_ed25519",
+            "credentials", "token", ".orion_code_config", "neurons.json",
+        )
+        for b in banned:
+            if b in low:
+                return f"Blocked: refusing to git add sensitive path matching '{b}'."
+        if re.search(r"\bgit\s+add\s+(-A|--all|\.)\s*$", low) and cwd == home:
+            return "Blocked: git add -A in HOME would stage private Termux files."
+    return None
+
+
 def tool_run_shell(command, confirm=False):
     low = command.lower().strip()
     for b in _DANGEROUS:
         if b in low:
             return f"Blocked: {command}"
+    git_block = _git_safety_check(command)
+    if git_block:
+        return git_block
     if re.search(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)", low) and not confirm:
         return "Destructive rm -rf requires confirm=true after user approval."
     if command.rstrip().endswith("&") or " & " in command:
@@ -1103,7 +1299,7 @@ TOOL_DECLARATIONS = [
     {"name": "list_directory", "description": "List directory.", "parameters": _params({"path": {"type": "string"}})},
     {"name": "read_file", "description": "Read text file.", "parameters": _params({"path": {"type": "string"}}, ["path"])},
     {"name": "write_file", "description": "Write text file.", "parameters": _params({"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"])},
-    {"name": "run_shell", "description": "Run shell command with live output. Destructive needs confirm=true.", "parameters": _params({"command": {"type": "string"}, "confirm": {"type": "boolean"}}, ["command"])},
+    {"name": "run_shell", "description": "Run shell command with live output. Destructive needs confirm=true. For git: only inside a project folder, never $HOME. Never add .env or secrets.", "parameters": _params({"command": {"type": "string"}, "confirm": {"type": "boolean"}}, ["command"])},
     {"name": "get_cwd", "description": "Current directory.", "parameters": _params({})},
     {"name": "change_directory", "description": "Change directory.", "parameters": _params({"path": {"type": "string"}}, ["path"])},
     {"name": "fetch_url", "description": "Fetch URL text.", "parameters": _params({"url": {"type": "string"}, "max_chars": {"type": "integer"}}, ["url"])},
@@ -1372,6 +1568,13 @@ def build_system(brain=None):
         "Prefer short shell commands that finish; avoid background jobs and infinite loops.",
         "Confirm before destructive operations such as recursive deletes.",
         "Reply in the user's language with correct UTF-8 text.",
+        "Never store API tokens, passwords, or secrets in memory, brain, diary, or files.",
+        "Before any git write (init/add/commit/push), run pwd and git status. If cwd is $HOME, cd to the project first.",
+        "Never git init or git add in $HOME or storage shared root.",
+        "Never git add .env, .ssh, tokens, credentials, or whole Termux config.",
+        "Prefer few precise shell commands over many exploratory ones.",
+        "If git asks for credentials, stop and tell the user to run git push themselves with a PAT.",
+        "Do not loop on the same failing command more than twice; explain the fix instead.",
     ]
     if user_name:
         parts.append(f"The user's name is {user_name}. Address them as {user_name} when natural.")
@@ -1659,7 +1862,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
             if isinstance(part, dict) and part.get("text"):
                 expanded = expand_at_mentions(part["text"])
                 if expanded != part["text"]:
-                    cprint("  (@ files attached)", C.DIM)
+                    cprint("  (@ path resolved)", C.DIM)
                 new_parts.append({**part, "text": expanded})
             else:
                 new_parts.append(part)
@@ -1677,6 +1880,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
 
         history[:] = sanitize_history(history)
         history.append({"role": "user", "parts": user_parts})
+        handle_turn._recent_tools = []
 
         try:
             if use_stream:
@@ -1704,7 +1908,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                     except Exception as ex:
                         cprint(f"  (stream fallback: {ex})", C.DIM)
 
-            for _ in range(10):
+            for _ in range(40):
                 cprint("... thinking", C.DIM)
                 if len(history) > 16:
                     history[:] = compact_history(history, keep_last=12)
@@ -1734,6 +1938,23 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                 for fc in fcalls:
                     name = fc.get("name", "")
                     args = fc.get("args") or {}
+                    sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+                    if not hasattr(handle_turn, "_recent_tools"):
+                        handle_turn._recent_tools = []
+                    recent = handle_turn._recent_tools
+                    if recent.count(sig) >= 2:
+                        result = (
+                            "Stopped: same tool/args repeated 3 times. "
+                            "Change approach or ask the user to run the command manually."
+                        )
+                        cprint(f"  -> {name} (blocked repeat)", C.YELLOW)
+                        fn_responses.append(
+                            {"functionResponse": {"name": name, "response": {"result": result}}}
+                        )
+                        continue
+                    recent.append(sig)
+                    if len(recent) > 30:
+                        handle_turn._recent_tools = recent[-20:]
                     cprint(f"  -> {name}({args})", C.DIM)
                     impl = TOOL_IMPL.get(name)
                     try:
@@ -1749,7 +1970,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                     )
                 history.append({"role": "user", "parts": fn_responses})
             else:
-                cprint("(tool step limit)", C.YELLOW)
+                cprint("(tool step limit — try a smaller task or run git yourself)", C.YELLOW)
             history[:] = sanitize_history(history)
             auto_save_history(history)
             try:
@@ -1809,7 +2030,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                 "  /fichas /gustos    Preference cards\n"
                 "  /diario /backup    Diary / backup\n"
                 "  /save /load        Sessions\n"
-                "  @file.py           Attach file to message\n"
+                "  @file or @folder   Attach file/folder (searches storage)\n"
             )
 
         if user_input.strip() == "/" or low in ("/help", "/ayuda", "/comandos"):
@@ -1941,13 +2162,13 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Orion Code 3.3.1 (Termux)")
+    parser = argparse.ArgumentParser(description="Orion Code 3.5.0 (Termux)")
     parser.add_argument("-m", "--model", default=None)
     parser.add_argument("-p", "--prompt", default=None)
     parser.add_argument("--no-stream", action="store_true")
-    parser.add_argument("--version", action="version", version="3.3.1")
+    parser.add_argument("--version", action="version", version="3.5.0")
     args = parser.parse_args()
-    cprint("Orion Code 3.3.1", C.BOLD)
+    cprint("Orion Code 3.5.0", C.BOLD)
     api_key = load_api_key()
     model = args.model or load_saved_model(DEFAULT_MODEL)
     if args.model:
