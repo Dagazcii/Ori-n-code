@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Orion Code installer for Termux
 set -e
-VERSION="3.0"
+VERSION="3.2"
 echo ""
 echo "  Orion Code ${VERSION}"
 echo ""

@@ -1,14 +1,13 @@
 # Orion Code
 
-Terminal agent for Termux (Android) using the Gemini API.
+Terminal agent for Termux using the Gemini API.
 
 ## Features
 
-- File and shell tools with live output
-- Git helpers and project context
+- File, shell, git, and project tools
 - `@path` file mentions
-- Project instructions via `ORION.md` / `GEMINI.md` / `AGENTS.md`
-- Persistent local state (preferences, sessions, backup)
+- `ORION.md` / `GEMINI.md` project instructions
+- Session restore, history compaction
 - Optional: `requests`, `tenacity`, `rich`
 
 ## Install (Termux)
@@ -16,19 +15,16 @@ Terminal agent for Termux (Android) using the Gemini API.
 ```bash
 pkg install python git
 pip install requests tenacity rich
-termux-setup-storage
-cd /path/to/orion-code
 bash install.sh
 orion
 ```
 
-Set `GEMINI_API_KEY` or enter it on first run.
+Set `GEMINI_API_KEY` or enter it on first launch.
 
 ## Usage
 
 ```text
 orion
-orion -p "summarize this error"
 explica @main.py
 /proyecto
 /
