@@ -45,11 +45,90 @@ except ImportError:
 
 try:
     from rich.console import Console
+    from rich.syntax import Syntax
+    from rich.markdown import Markdown as RichMarkdown
     USE_RICH = True
     _console = Console(force_terminal=True)
 except ImportError:
     USE_RICH = False
+    RichMarkdown = None
+    Syntax = None
     _console = None
+
+try:
+    from dotenv import load_dotenv
+    USE_DOTENV = True
+except ImportError:
+    USE_DOTENV = False
+    load_dotenv = None
+
+try:
+    import httpx
+    USE_HTTPX = True
+except ImportError:
+    USE_HTTPX = False
+    httpx = None
+
+try:
+    import yaml
+    USE_YAML = True
+except ImportError:
+    USE_YAML = False
+    yaml = None
+
+try:
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.history import FileHistory
+    USE_PROMPT_TOOLKIT = True
+except ImportError:
+    USE_PROMPT_TOOLKIT = False
+    pt_prompt = None
+    FileHistory = None
+
+try:
+    from pygments import highlight
+    from pygments.lexers import guess_lexer_for_filename, TextLexer
+    from pygments.formatters import TerminalFormatter
+    USE_PYGMENTS = True
+except ImportError:
+    USE_PYGMENTS = False
+
+try:
+    from markdown_it import MarkdownIt
+    USE_MARKDOWN_IT = True
+    _md = MarkdownIt()
+except ImportError:
+    USE_MARKDOWN_IT = False
+    _md = None
+
+
+try:
+    import git as gitpython
+    USE_GITPYTHON = True
+except ImportError:
+    USE_GITPYTHON = False
+    gitpython = None
+
+try:
+    import chardet
+    USE_CHARDET = True
+except ImportError:
+    USE_CHARDET = False
+    chardet = None
+
+try:
+    import toml
+    USE_TOML = True
+except ImportError:
+    USE_TOML = False
+    toml = None
+
+try:
+    import jq as jq_mod
+    USE_JQ = True
+except ImportError:
+    USE_JQ = False
+    jq_mod = None
 
 try:
     from orion_brain import (
@@ -74,6 +153,19 @@ MEMORY_PATH = Path.home() / ".orion_code_memory.md"
 SESSIONS_DIR = Path.home() / ".orion_code_sessions"
 LAST_SESSION_PATH = Path.home() / ".orion-code" / "last_session.json"
 DIARY_PATH = Path.home() / ".orion-code" / "diary.md"
+
+def _load_env_files():
+    if not USE_DOTENV:
+        return
+    for envp in (Path.cwd() / ".env", Path.home() / ".orion-code" / ".env", Path.home() / ".env"):
+        try:
+            if envp.is_file():
+                load_dotenv(envp, override=False)
+        except Exception:
+            pass
+
+_load_env_files()
+
 AVAILABLE_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -102,19 +194,40 @@ def agent_label() -> str:
     return str(get_pref("agent_name") or "Orion")
 
 
+
+_SECRET_RE = re.compile(
+    r"(?i)(\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AIza[0-9A-Za-z\-_]{20,}"
+    r"|sk-[A-Za-z0-9]{20,})"
+)
+
+
+def redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    return _SECRET_RE.sub("[REDACTED_SECRET]", text)
+
 def print_assistant(text: str) -> None:
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
-    text = (text or "").strip()
+    text = redact_secrets((text or "").strip())
     if not text:
         return
     print()
     cprint(f"{agent_label()}:", C.GREEN + C.BOLD)
     try:
-        print(text)
-    except UnicodeEncodeError:
-        sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
-        sys.stdout.buffer.flush()
+        if USE_RICH and _console is not None and RichMarkdown is not None:
+            _console.print(RichMarkdown(text))
+        else:
+            print(text)
+    except Exception:
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
+            sys.stdout.buffer.flush()
     print()
 
 
@@ -356,16 +469,22 @@ def agent_label() -> str:
 def print_assistant(text: str) -> None:
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
-    text = (text or "").strip()
+    text = redact_secrets((text or "").strip())
     if not text:
         return
     print()
     cprint(f"{agent_label()}:", C.GREEN + C.BOLD)
     try:
-        print(text)
-    except UnicodeEncodeError:
-        sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
-        sys.stdout.buffer.flush()
+        if USE_RICH and _console is not None and RichMarkdown is not None:
+            _console.print(RichMarkdown(text))
+        else:
+            print(text)
+    except Exception:
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
+            sys.stdout.buffer.flush()
     print()
 
 
@@ -804,7 +923,7 @@ def _format_file(path: Path, max_file_chars: int) -> str:
     try:
         if path.stat().st_size > 400_000:
             return f"[file too large] {path} ({path.stat().st_size} bytes)"
-        body = path.read_text(encoding="utf-8", errors="replace")
+        body = read_text_smart(path, max_bytes=400_000)
     except Exception as ex:
         return f"[read error] {path}: {ex}"
     if len(body) > max_file_chars:
@@ -902,6 +1021,18 @@ def load_project_instructions(root: Path | None = None) -> str:
                 lines.append(f"### {name}\n{fp.read_text(encoding='utf-8', errors='replace')[:8000]}")
             except Exception:
                 pass
+    if USE_YAML:
+        for name in ("ORION.yaml", "ORION.yml", "orion.yaml", ".orion.yaml"):
+            fp = root / name
+            if fp.is_file() and fp.stat().st_size < 100_000:
+                try:
+                    data = yaml.safe_load(fp.read_text(encoding="utf-8", errors="replace"))
+                    lines.append(f"### {name}\n{json.dumps(data, ensure_ascii=False, indent=2)[:8000]}")
+                except Exception:
+                    try:
+                        lines.append(f"### {name}\n{fp.read_text(encoding='utf-8', errors='replace')[:8000]}")
+                    except Exception:
+                        pass
     return "\n\n".join(lines)
 
 
@@ -925,12 +1056,23 @@ def snapshot_project_brief(root: Path | None = None, max_entries: int = 35) -> s
         fp = root / name
         if fp.is_file() and fp.stat().st_size < 60_000:
             try:
-                lines.append(
-                    f"\n--- {name} ---\n"
-                    + fp.read_text(encoding="utf-8", errors="replace")[:2000]
-                )
+                if name == "pyproject.toml" and USE_TOML:
+                    data = toml.loads(read_text_smart(fp))
+                    lines.append(
+                        f"\n--- {name} ---\n"
+                        + json.dumps(data, ensure_ascii=False, indent=2)[:2500]
+                    )
+                else:
+                    lines.append(
+                        f"\n--- {name} ---\n" + read_text_smart(fp)[:2000]
+                    )
             except Exception:
-                pass
+                try:
+                    lines.append(
+                        f"\n--- {name} ---\n" + read_text_smart(fp)[:2000]
+                    )
+                except Exception:
+                    pass
     return "\n".join(lines)
 
 
@@ -956,6 +1098,23 @@ _DANGEROUS = [
 ]
 
 
+
+def read_text_smart(path: Path, max_bytes: int = 500_000) -> str:
+    """Read text file with encoding detection (chardet if available)."""
+    data = path.read_bytes()[:max_bytes]
+    if not data:
+        return ""
+    if USE_CHARDET:
+        try:
+            guess = chardet.detect(data) or {}
+            enc = guess.get("encoding") or "utf-8"
+            conf = float(guess.get("confidence") or 0)
+            if conf >= 0.6:
+                return data.decode(enc, errors="replace")
+        except Exception:
+            pass
+    return data.decode("utf-8", errors="replace")
+
 def tool_list_directory(path="."):
     try:
         p = Path(path).expanduser().resolve()
@@ -977,7 +1136,7 @@ def tool_read_file(path):
             return f"Not a file: {path}"
         if p.stat().st_size > 500_000:
             return "File too large"
-        return p.read_text(encoding="utf-8", errors="replace")[:50000]
+        return read_text_smart(p)[:50000]
     except Exception as e:
         return f"Error: {e}"
 
@@ -1102,7 +1261,13 @@ def tool_fetch_url(url, max_chars=8000):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         headers = {"User-Agent": "OrionCode/3.0"}
-        if USE_REQUESTS:
+        if USE_HTTPX:
+            r = httpx.get(url, headers=headers, timeout=25.0, follow_redirects=True)
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "")
+            raw = r.content[:500_000]
+            text_body = r.content.decode("utf-8", errors="replace")
+        elif USE_REQUESTS:
             r = _requests.get(url, headers=headers, timeout=25)
             r.raise_for_status()
             ctype = r.headers.get("Content-Type", "")
@@ -1218,22 +1383,85 @@ def _git(args, timeout=30):
 
 
 def tool_git_status():
+    if USE_GITPYTHON:
+        try:
+            repo = gitpython.Repo(os.getcwd(), search_parent_directories=True)
+            out = []
+            out.append(f"Repo: {repo.working_tree_dir}")
+            out.append(f"Branch: {repo.active_branch.name if not repo.head.is_detached else 'DETACHED'}")
+            if repo.is_dirty(untracked_files=True):
+                out.append("Dirty: yes")
+            else:
+                out.append("Dirty: no")
+            changed = [item.a_path for item in repo.index.diff(None)]
+            staged = [item.a_path for item in repo.index.diff("HEAD")]
+            untracked = list(repo.untracked_files)
+            if staged:
+                out.append("Staged:\n  " + "\n  ".join(staged[:40]))
+            if changed:
+                out.append("Modified:\n  " + "\n  ".join(changed[:40]))
+            if untracked:
+                out.append("Untracked:\n  " + "\n  ".join(untracked[:40]))
+            return "\n".join(out)
+        except Exception as e:
+            return _git(["status", "-sb"]) + f"\n(GitPython fallback: {e})"
     return _git(["status", "-sb"])
 
 
 def tool_git_diff(staged=False):
+    if USE_GITPYTHON:
+        try:
+            repo = gitpython.Repo(os.getcwd(), search_parent_directories=True)
+            if staged:
+                diff = repo.git.diff("--staged")
+            else:
+                diff = repo.git.diff()
+            return (diff or "(empty diff)")[:30000]
+        except Exception as e:
+            return _git(["diff", "--staged"] if staged else ["diff"]) + f"\n(GitPython fallback: {e})"
     return _git(["diff", "--staged"] if staged else ["diff"])
 
 
 def tool_git_log(n=10):
-    return _git(["log", f"-{max(1, min(int(n), 30))}", "--oneline", "--decorate"])
+    n = max(1, min(int(n), 30))
+    if USE_GITPYTHON:
+        try:
+            repo = gitpython.Repo(os.getcwd(), search_parent_directories=True)
+            lines = []
+            for c in repo.iter_commits(max_count=n):
+                lines.append(f"{c.hexsha[:8]} {c.summary}")
+            return "\n".join(lines) if lines else "(no commits)"
+        except Exception as e:
+            return _git(["log", f"-{n}", "--oneline", "--decorate"]) + f"\n(GitPython fallback: {e})"
+    return _git(["log", f"-{n}", "--oneline", "--decorate"])
 
 
 def tool_git_commit(message, confirm=False):
     if not confirm:
         return "Commit requires confirm=true after user approval."
+    if USE_GITPYTHON:
+        try:
+            repo = gitpython.Repo(os.getcwd(), search_parent_directories=True)
+            # commit staged only
+            ci = repo.index.commit(message)
+            return f"Committed {ci.hexsha[:8]}: {message}"
+        except Exception as e:
+            return _git(["commit", "-m", message]) + f"\n(GitPython fallback: {e})"
     return _git(["commit", "-m", message])
 
+
+
+def tool_jq_filter(data: str, expression: str = "."):
+    """Filter JSON text with jq expression (if python-jq installed)."""
+    if not USE_JQ:
+        return "jq module not installed"
+    try:
+        obj = json.loads(data) if isinstance(data, str) else data
+        prog = jq_mod.compile(expression)
+        result = prog.input_value(obj).all()
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    except Exception as e:
+        return f"jq error: {e}"
 
 def tool_memory_read():
     return memory_read() or "(empty)"
@@ -1289,6 +1517,7 @@ TOOL_IMPL = {
     "git_diff": lambda a: tool_git_diff(bool(a.get("staged", False))),
     "git_log": lambda a: tool_git_log(a.get("n", 10)),
     "git_commit": lambda a: tool_git_commit(a.get("message", ""), bool(a.get("confirm", False))),
+    "jq_filter": lambda a: tool_jq_filter(a.get("data", ""), a.get("expression", ".")),
     "memory_read": lambda a: tool_memory_read(),
     "memory_write": lambda a: tool_memory_write(a.get("text", "")),
     "memory_clear": lambda a: tool_memory_clear(),
@@ -1312,6 +1541,7 @@ TOOL_DECLARATIONS = [
     {"name": "git_diff", "description": "git diff.", "parameters": _params({"staged": {"type": "boolean"}})},
     {"name": "git_log", "description": "git log.", "parameters": _params({"n": {"type": "integer"}})},
     {"name": "git_commit", "description": "git commit (confirm=true).", "parameters": _params({"message": {"type": "string"}, "confirm": {"type": "boolean"}}, ["message"])},
+    {"name": "jq_filter", "description": "Filter JSON with a jq expression.", "parameters": _params({"data": {"type": "string"}, "expression": {"type": "string"}}, ["data"])},
     {"name": "memory_read", "description": "Read notes memory.", "parameters": _params({})},
     {"name": "memory_write", "description": "Append notes memory.", "parameters": _params({"text": {"type": "string"}}, ["text"])},
     {"name": "memory_clear", "description": "Clear notes memory.", "parameters": _params({})},
@@ -1390,6 +1620,16 @@ def classify_network_error(exc: BaseException) -> str:
 
 
 def _gemini_post_once(url, body, headers):
+    if USE_HTTPX:
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(url, json=body, headers=headers)
+            if r.status_code >= 400:
+                try:
+                    msg = r.json().get("error", {}).get("message", r.text)
+                except Exception:
+                    msg = r.text
+                raise RuntimeError(f"HTTP {r.status_code}: {msg}")
+            return r.json()
     if USE_REQUESTS:
         r = _requests.post(url, json=body, headers=headers, timeout=120)
         if r.status_code >= 400:
@@ -1474,10 +1714,34 @@ def gemini_stream_text(api_key, model, contents, system_instruction=None):
             return
         if isinstance(tx, bytes):
             tx = tx.decode("utf-8", errors="replace")
+        tx = redact_secrets(tx)
         print(tx, end="", flush=True)
         full.append(tx)
 
-    if USE_REQUESTS:
+    if USE_HTTPX:
+        with httpx.Client(timeout=120.0) as client:
+            with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body_err = resp.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(f"HTTP {resp.status_code}: {body_err[:400]}")
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(payload)
+                    except Exception:
+                        continue
+                    for part in extract_parts(obj):
+                        emit(part.get("text") or "")
+    elif USE_REQUESTS:
         with _requests.post(url, json=body, headers=headers, timeout=120, stream=True) as resp:
             if resp.status_code >= 400:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:400]}")
@@ -1538,6 +1802,9 @@ def should_try_text_stream(user_text: str) -> bool:
 
 def network_reachable(timeout: float = 3.0) -> bool:
     try:
+        if USE_HTTPX:
+            r = httpx.head("https://www.google.com/", timeout=timeout, follow_redirects=True)
+            return r.status_code < 500
         if USE_REQUESTS:
             r = _requests.head("https://www.google.com/", timeout=timeout, allow_redirects=True)
             return r.status_code < 500
@@ -1575,6 +1842,8 @@ def build_system(brain=None):
         "Prefer few precise shell commands over many exploratory ones.",
         "If git asks for credentials, stop and tell the user to run git push themselves with a PAT.",
         "Do not loop on the same failing command more than twice; explain the fix instead.",
+"Never print API keys, GitHub PATs, or passwords. If the user pastes command output, reply once with a short summary — do not celebrate each line.",
+"Never put tokens inside git remote URLs.",
     ]
     if user_name:
         parts.append(f"The user's name is {user_name}. Address them as {user_name} when natural.")
@@ -1721,8 +1990,53 @@ def compact_history(history: list, keep_last: int = 12) -> list:
     return ensure_api_history([compact_turn] + recent)
 
 
+def _drain_stdin_lines(first: str, grace: float = 0.12) -> str:
+    """If the user pasted several lines, read them as one message."""
+    lines = [first]
+    while True:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], grace)
+        except (ValueError, OSError):
+            break
+        if not ready:
+            break
+        more = sys.stdin.readline()
+        if more == "":
+            break
+        lines.append(more.rstrip("\n"))
+        grace = 0.08
+    return "\n".join(lines)
+
+
+def _pt_history():
+    try:
+        hist = Path.home() / ".orion-code" / "input_history"
+        hist.parent.mkdir(parents=True, exist_ok=True)
+        return FileHistory(str(hist))
+    except Exception:
+        return None
+
+
 def _input_with_timeout(prompt: str, timeout: float):
-    # Always start the prompt on a fresh line (avoids "you> you>")
+    # prompt_toolkit path (better editing/history). Timeout approximated with select first.
+    if USE_PROMPT_TOOLKIT and sys.stdin.isatty():
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except (ValueError, OSError):
+            ready = True
+        if not ready:
+            print(flush=True)
+            return None
+        try:
+            # strip ANSI for prompt_toolkit
+            plain = re.sub(r"\033\[[0-9;]*m", "", prompt)
+            text = pt_prompt(plain, history=_pt_history())
+            return text
+        except (EOFError, KeyboardInterrupt):
+            raise
+        except Exception:
+            pass  # fall back to classic input
+
     print(prompt, end="", flush=True)
     try:
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -1735,8 +2049,8 @@ def _input_with_timeout(prompt: str, timeout: float):
         line = sys.stdin.readline()
         if line == "":
             raise EOFError
-        return line.rstrip("\n")
-    # Timeout: move to next line so the next prompt is not glued
+        line = line.rstrip("\n")
+        return _drain_stdin_lines(line)
     print(flush=True)
     return None
 
@@ -1801,12 +2115,33 @@ def print_banner(model: str) -> None:
     print(f"\033[2m  {'-' * 40}{reset}")
     cprint(f"  Model  {model}", C.CYAN)
     cprint(f"  Dir    {os.getcwd()}", C.DIM)
-    http = "requests" if USE_REQUESTS else "urllib"
+    if USE_HTTPX:
+        http = "httpx"
+    elif USE_REQUESTS:
+        http = "requests"
+    else:
+        http = "urllib"
     extras = []
     if USE_TENACITY:
         extras.append("retry")
     if USE_RICH:
         extras.append("rich")
+    if USE_PROMPT_TOOLKIT:
+        extras.append("ptk")
+    if USE_DOTENV:
+        extras.append("dotenv")
+    if USE_YAML:
+        extras.append("yaml")
+    if USE_PYGMENTS:
+        extras.append("pygments")
+    if USE_GITPYTHON:
+        extras.append("git")
+    if USE_CHARDET:
+        extras.append("chardet")
+    if USE_TOML:
+        extras.append("toml")
+    if USE_JQ:
+        extras.append("jq")
     cprint(f"  HTTP   {http}" + (f" +{'+'.join(extras)}" if extras else ""), C.DIM)
     cprint("  Type / for commands", C.DIM)
     print(f"\033[2m  {'-' * 40}{reset}")
@@ -1879,6 +2214,14 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
             pass
 
         history[:] = sanitize_history(history)
+        # redact secrets in user parts before API / history
+        safe_parts = []
+        for part in user_parts:
+            if isinstance(part, dict) and part.get("text"):
+                safe_parts.append({**part, "text": redact_secrets(part["text"])})
+            else:
+                safe_parts.append(part)
+        user_parts = safe_parts
         history.append({"role": "user", "parts": user_parts})
         handle_turn._recent_tools = []
 
@@ -2069,7 +2412,9 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
             cprint(f"Compacted {before} -> {len(history)}", C.GREEN)
             continue
         if low in ("/red", "/net"):
-            cprint(f"HTTP client: {'requests' if USE_REQUESTS else 'urllib'}", C.DIM)
+            http = "httpx" if USE_HTTPX else ("requests" if USE_REQUESTS else "urllib")
+            cprint(f"HTTP client: {http}", C.DIM)
+            cprint(f"extras: dotenv={USE_DOTENV} ptk={USE_PROMPT_TOOLKIT} yaml={USE_YAML} pygments={USE_PYGMENTS}", C.DIM)
             cprint("Online." if network_reachable() else "Offline.", C.GREEN if network_reachable() else C.YELLOW)
             continue
         if low in ("/proyecto", "/project", "/ctx"):
@@ -2162,13 +2507,13 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Orion Code 3.5.0 (Termux)")
+    parser = argparse.ArgumentParser(description="Orion Code 3.8.0 (Termux)")
     parser.add_argument("-m", "--model", default=None)
     parser.add_argument("-p", "--prompt", default=None)
     parser.add_argument("--no-stream", action="store_true")
-    parser.add_argument("--version", action="version", version="3.5.0")
+    parser.add_argument("--version", action="version", version="3.8.0")
     args = parser.parse_args()
-    cprint("Orion Code 3.5.0", C.BOLD)
+    cprint("Orion Code 3.8.0", C.BOLD)
     api_key = load_api_key()
     model = args.model or load_saved_model(DEFAULT_MODEL)
     if args.model:
