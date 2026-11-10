@@ -1249,10 +1249,21 @@ def tool_run_shell(command, confirm=False):
         )
     )
     timeout = 600 if is_long else 120
+    # Never hang the UI on interactive git password prompts
+    if re.search(r"\bgit\s+(push|pull|fetch|clone)\b", low):
+        timeout = min(timeout, 180)
     print(f"{C.DIM}$ {command}{C.RESET}", flush=True)
     ui_emit("shell_line", f"$ {command}")
     ui_emit("progress", "running")
     collected = []
+    run_env = os.environ.copy()
+    run_env["GIT_TERMINAL_PROMPT"] = "0"
+    run_env["GIT_ASKPASS"] = run_env.get("GIT_ASKPASS", "echo")
+    if re.search(r"\bgit\s+(push|pull|fetch|clone)\b", low):
+        try:
+            run_env = _push_env()
+        except Exception:
+            pass
     try:
         proc = subprocess.Popen(
             command,
@@ -1264,13 +1275,17 @@ def tool_run_shell(command, confirm=False):
             bufsize=1,
             encoding="utf-8",
             errors="replace",
+            env=run_env,
         )
         assert proc.stdout is not None
         deadline = time.time() + timeout
         while True:
             if time.time() > deadline:
                 proc.kill()
-                collected.append(f"\n[timeout {timeout}s]")
+                collected.append(
+                    f"\n[timeout {timeout}s — command killed; "
+                    "if git push hung, set GITHUB_TOKEN and use git_push tool]"
+                )
                 break
             line = proc.stdout.readline()
             if line:
@@ -2065,7 +2080,7 @@ def build_system(brain=None, force: bool = False):
         "Never git init or git add in $HOME or storage shared root.",
         "Never git add .env, .ssh, tokens, credentials, or whole Termux config.",
         "Prefer few precise shell commands over many exploratory ones.",
-"Git: cd project, git_status, git_add, git_commit confirm=true, git_push confirm=true. Auth via GITHUB_TOKEN/GH_TOKEN env, never print token or put it in URL.",
+"Git: cd project, then use tools git_status, git_add, git_commit (confirm=true), git_push (confirm=true). Do NOT chain git push inside run_shell (hangs on auth). Auth via GITHUB_TOKEN/GH_TOKEN only.",
         "If git asks for credentials, stop and tell the user to run git push themselves with a PAT.",
         "Do not loop on the same failing command more than twice; explain the fix instead.",
 "Never print API keys, GitHub PATs, or passwords. If the user pastes command output, reply once with a short summary — do not celebrate each line.",
@@ -2810,7 +2825,7 @@ def main():
     parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--cli", action="store_true", help="Classic line UI")
     parser.add_argument("--tui", action="store_true", help="Textual full-screen UI")
-    parser.add_argument("--version", action="version", version="3.13.0")
+    parser.add_argument("--version", action="version", version="3.13.1")
     args = parser.parse_args()
 
     api_key = load_api_key()

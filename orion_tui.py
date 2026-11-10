@@ -573,7 +573,18 @@ class OrionTUI(App):
         text = (event.value or "").strip()
         event.input.value = ""
         self._hide_hint()
-        if not text or self._busy:
+        if not text:
+            return
+        if self._busy:
+            if text.lower() in ("/cancel", "/stop", "cancel"):
+                self._busy = False
+                self._chat("[yellow]Marked idle. Previous task may still finish in background.[/]")
+                try:
+                    self.query_one("#prog", ProgressBar).update(progress=0)
+                except Exception:
+                    pass
+            else:
+                self._chat("[dim]Busy… wait or type /cancel[/]")
             return
         if self._handle_config_step(text):
             return
@@ -581,11 +592,10 @@ class OrionTUI(App):
             return
         self._chat(f"[bold blue]you>[/] {text}")
         self._busy = True
-        event.input.disabled = True
         self._stream_open = False
         prog = self.query_one("#prog", ProgressBar)
         prog.update(total=100, progress=5)
-        self._chat("[dim]… thinking[/]")
+        self._chat("[dim]… thinking (type /cancel if stuck)[/]")
         self._worker_turn(text)
 
     @work(thread=True, exclusive=True)
@@ -718,7 +728,10 @@ class OrionTUI(App):
         prog = self.query_one("#prog", ProgressBar)
         prog.update(progress=100)
         inp = self.query_one("#input", Input)
-        inp.disabled = False
+        try:
+            inp.disabled = False
+        except Exception:
+            pass
         inp.focus()
         self._refresh_status()
         try:
