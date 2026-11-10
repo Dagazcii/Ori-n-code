@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Orion Code installer for Termux
 set -e
-VERSION="3.2"
+VERSION="3.13"
 echo ""
 echo "  Orion Code ${VERSION}"
 echo ""
@@ -30,6 +30,7 @@ mkdir -p "$INSTALL_DIR"
 cp -f "$SRC" "$INSTALL_DIR/orion_code.py"
 chmod +x "$INSTALL_DIR/orion_code.py"
 [ -f "$SCRIPT_DIR/orion_brain.py" ] && cp -f "$SCRIPT_DIR/orion_brain.py" "$INSTALL_DIR/"
+[ -f "$SCRIPT_DIR/orion_tui.py" ] && cp -f "$SCRIPT_DIR/orion_tui.py" "$INSTALL_DIR/"
 [ -f "$SCRIPT_DIR/soul_default.md" ] && cp -f "$SCRIPT_DIR/soul_default.md" "$INSTALL_DIR/"
 [ -f "$SCRIPT_DIR/README.md" ] && cp -f "$SCRIPT_DIR/README.md" "$INSTALL_DIR/" 2>/dev/null || true
 

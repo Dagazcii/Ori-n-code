@@ -8,7 +8,14 @@ os.environ.setdefault("PYTHONUTF8", "1")
 
 import base64
 import getpass
+import gc
 import json
+try:
+    import orjson
+    USE_ORJSON = True
+except ImportError:
+    orjson = None
+    USE_ORJSON = False
 import mimetypes
 import random
 import re
@@ -175,11 +182,38 @@ AVAILABLE_MODELS = [
 ]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _API_KEY_REF = {"key": "", "model": DEFAULT_MODEL}
+# Optional UI callbacks: {"shell_line": fn(str), "stream_token": fn(str), "progress": fn(str)}
+UI_HOOKS = {}
+
+def ui_emit(kind: str, payload: str) -> None:
+    fn = UI_HOOKS.get(kind)
+    if callable(fn):
+        try:
+            fn(payload)
+        except Exception:
+            pass
+_SYSTEM_CACHE = {"key": None, "text": ""}
 _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
     "dist", "build", ".idea", ".gradle", "target", ".next",
 }
 
+
+
+def _json_loads(data):
+    if USE_ORJSON and isinstance(data, (bytes, bytearray)):
+        return orjson.loads(data)
+    if USE_ORJSON and isinstance(data, str):
+        return orjson.loads(data.encode("utf-8"))
+    if isinstance(data, (bytes, bytearray)):
+        return json.loads(data.decode("utf-8"))
+    return json.loads(data)
+
+
+def _json_dumps(obj, indent=None) -> str:
+    if USE_ORJSON and indent is None:
+        return orjson.dumps(obj, option=orjson.OPT_NON_ASCII).decode("utf-8")
+    return json.dumps(obj, ensure_ascii=False, indent=indent)
 
 class C:
     RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -313,6 +347,10 @@ def show_config():
         or os.environ.get("GOOGLE_API_KEY")
         or (Path.cwd() / ".env").exists()
     )
+    try:
+        cwd = str(Path.cwd())
+    except Exception:
+        cwd = "?"
     print(
         "\n"
         "  Current settings\n"
@@ -322,6 +360,7 @@ def show_config():
         f"  3) Model         {model}\n"
         f"  4) Auto mode     {auto}\n"
         f"  5) API key       {'set' if key_set else 'not set'}\n"
+        f"  cwd              {cwd}\n"
         "  0) Back\n"
     )
 
@@ -719,11 +758,11 @@ def auto_save_history(history):
             "history": history,
         }
         LAST_SESSION_PATH.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            _json_dumps(payload, indent=2), encoding="utf-8"
         )
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         (SESSIONS_DIR / "autosave.json").write_text(
-            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+            _json_dumps(history), encoding="utf-8"
         )
     except Exception:
         pass
@@ -736,13 +775,13 @@ def auto_save_history(history):
 def auto_load_history():
     try:
         if LAST_SESSION_PATH.exists():
-            data = json.loads(LAST_SESSION_PATH.read_text(encoding="utf-8"))
+            data = _json_loads(LAST_SESSION_PATH.read_text(encoding="utf-8"))
             h = data.get("history") if isinstance(data, dict) else data
             if isinstance(h, list) and h:
                 return h, data.get("saved_at", "?") if isinstance(data, dict) else "?"
         bak = SESSIONS_DIR / "autosave.json"
         if bak.exists():
-            h = json.loads(bak.read_text(encoding="utf-8"))
+            h = _json_loads(bak.read_text(encoding="utf-8"))
             if isinstance(h, list) and h:
                 return h, "autosave"
     except Exception:
@@ -843,6 +882,15 @@ def _find_by_name(name: str, roots: list, max_hits: int = 8) -> list:
     """Find files/dirs named name under roots (depth-limited)."""
     name_l = name.lower().rstrip("/")
     hits = []
+    # Prefer real git repos when user says @git / @repo
+    if name_l in ("git", "repo", "repository"):
+        for root in roots:
+            try:
+                for child in root.iterdir():
+                    if child.is_dir() and (child / ".git").exists():
+                        hits.append(child.resolve())
+            except Exception:
+                pass
     skip = _IGNORE_DIRS | {"Android", "DCIM", "Alarms", "Notifications", "Ringtones"}
     for root in roots:
         try:
@@ -1202,6 +1250,8 @@ def tool_run_shell(command, confirm=False):
     )
     timeout = 600 if is_long else 120
     print(f"{C.DIM}$ {command}{C.RESET}", flush=True)
+    ui_emit("shell_line", f"$ {command}")
+    ui_emit("progress", "running")
     collected = []
     try:
         proc = subprocess.Popen(
@@ -1225,16 +1275,20 @@ def tool_run_shell(command, confirm=False):
             line = proc.stdout.readline()
             if line:
                 print(line, end="", flush=True)
+                ui_emit("shell_line", line.rstrip("\n"))
                 collected.append(line)
             elif proc.poll() is not None:
                 rest = proc.stdout.read()
                 if rest:
                     print(rest, end="", flush=True)
+                    for ln in rest.splitlines():
+                        ui_emit("shell_line", ln)
                     collected.append(rest)
                 break
             else:
                 time.sleep(0.05)
         code = proc.returncode if proc.returncode is not None else -1
+        ui_emit("progress", "idle")
         out = "".join(collected).strip() or "(no output)"
         return out[:20000] + f"\n[exit: {code}]"
     except Exception as e:
@@ -1450,6 +1504,152 @@ def tool_git_commit(message, confirm=False):
     return _git(["commit", "-m", message])
 
 
+def _git_repo_root():
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10, cwd=os.getcwd(),
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def tool_git_add(paths=".", confirm=False):
+    root = _git_repo_root()
+    if not root:
+        return "Not inside a git repository. cd to the project folder first."
+    if Path.cwd().resolve() == Path.home().resolve():
+        return "Blocked: cannot git add from $HOME. cd to the project directory."
+    paths = (paths or ".").strip()
+    low = paths.lower()
+    for b in (".env", ".ssh", "id_rsa", "id_ed25519", "credentials", ".gitconfig"):
+        if b in low:
+            return f"Blocked: refusing to add sensitive path ({b})."
+    args = ["add"]
+    if paths in ("-A", "--all"):
+        args.append("-A")
+    else:
+        args.extend(paths.split())
+    return _git(args)
+
+
+def tool_git_remote(action="list", url="", name="origin"):
+    action = (action or "list").lower().strip()
+    if action == "list":
+        return _git(["remote", "-v"])
+    if "ghp_" in (url or "") or "github_pat_" in (url or ""):
+        return "Blocked: do not put tokens in remote URL. Use GITHUB_TOKEN env or credential helper."
+    if action in ("set-url", "set"):
+        if not url:
+            return "url required for set-url"
+        return _git(["remote", "set-url", name or "origin", url])
+    if action == "add":
+        if not url:
+            return "url required for add"
+        return _git(["remote", "add", name or "origin", url])
+    return f"Unknown action: {action}. Use list, set-url, or add."
+
+
+def _push_env():
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    token = (
+        env.get("GITHUB_TOKEN") or env.get("GH_TOKEN") or env.get("GIT_TOKEN") or ""
+    ).strip()
+    if token:
+        askpass = Path.home() / ".orion-code" / "git-askpass.sh"
+        try:
+            askpass.parent.mkdir(parents=True, exist_ok=True)
+            askpass.write_text(
+                "#!/data/data/com.termux/files/usr/bin/sh\n"
+                "if echo \"$1\" | grep -qi username; then\n"
+                "  echo \"x-access-token\"\n"
+                "else\n"
+                "  echo \"${GITHUB_TOKEN:-${GH_TOKEN:-${GIT_TOKEN:-}}}\"\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            askpass.chmod(0o700)
+            env["GIT_ASKPASS"] = str(askpass)
+            env["GITHUB_TOKEN"] = token
+            env["GH_TOKEN"] = token
+            env["GIT_TOKEN"] = token
+        except Exception:
+            pass
+    return env
+
+
+def tool_git_push(branch="", set_upstream=True, confirm=False):
+    if not confirm:
+        return (
+            "Push requires confirm=true. "
+            "Set GITHUB_TOKEN or GH_TOKEN in Termux, or configure git credentials."
+        )
+    root = _git_repo_root()
+    if not root:
+        return "Not inside a git repository. cd to project first."
+    if Path(root).resolve() == Path.home().resolve():
+        return "Blocked: refusing push from $HOME repo."
+    args = ["push"]
+    if set_upstream:
+        args.append("-u")
+    args.append("origin")
+    if branch:
+        args.append(branch)
+    else:
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=10, cwd=os.getcwd(),
+            )
+            args.append(r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "main")
+        except Exception:
+            args.append("main")
+    env = _push_env()
+    try:
+        r = subprocess.run(
+            ["git"] + args,
+            capture_output=True, text=True, timeout=180, cwd=os.getcwd(), env=env,
+        )
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        out = redact_secrets(out)
+        if r.returncode != 0 and any(
+            x in out for x in ("could not read Username", "Authentication", "403", "401")
+        ):
+            out += (
+                "\nTip: export GITHUB_TOKEN=ghp_xxx "
+                "or: gh auth login  or  git config --global credential.helper store"
+            )
+        return (out.strip() or "(no output)") + f"\n[exit: {r.returncode}]"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def tool_git_pull(confirm=False):
+    if not confirm:
+        return "Pull requires confirm=true."
+    env = _push_env()
+    try:
+        r = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=120, cwd=os.getcwd(), env=env,
+        )
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        return redact_secrets(out.strip() or "(no output)") + f"\n[exit: {r.returncode}]"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def tool_git_init(confirm=False):
+    if not confirm:
+        return "git init requires confirm=true."
+    if Path.cwd().resolve() == Path.home().resolve():
+        return "Blocked: do not git init in $HOME."
+    return _git(["init", "-b", "main"])
+
 
 def tool_jq_filter(data: str, expression: str = "."):
     """Filter JSON text with jq expression (if python-jq installed)."""
@@ -1516,7 +1716,12 @@ TOOL_IMPL = {
     "git_status": lambda a: tool_git_status(),
     "git_diff": lambda a: tool_git_diff(bool(a.get("staged", False))),
     "git_log": lambda a: tool_git_log(a.get("n", 10)),
+    "git_add": lambda a: tool_git_add(a.get("paths", "."), bool(a.get("confirm", False))),
     "git_commit": lambda a: tool_git_commit(a.get("message", ""), bool(a.get("confirm", False))),
+    "git_push": lambda a: tool_git_push(a.get("branch", ""), bool(a.get("set_upstream", True)), bool(a.get("confirm", False))),
+    "git_pull": lambda a: tool_git_pull(bool(a.get("confirm", False))),
+    "git_remote": lambda a: tool_git_remote(a.get("action", "list"), a.get("url", ""), a.get("name", "origin")),
+    "git_init": lambda a: tool_git_init(bool(a.get("confirm", False))),
     "jq_filter": lambda a: tool_jq_filter(a.get("data", ""), a.get("expression", ".")),
     "memory_read": lambda a: tool_memory_read(),
     "memory_write": lambda a: tool_memory_write(a.get("text", "")),
@@ -1540,7 +1745,12 @@ TOOL_DECLARATIONS = [
     {"name": "git_status", "description": "git status.", "parameters": _params({})},
     {"name": "git_diff", "description": "git diff.", "parameters": _params({"staged": {"type": "boolean"}})},
     {"name": "git_log", "description": "git log.", "parameters": _params({"n": {"type": "integer"}})},
+    {"name": "git_add", "description": "Stage files (paths or .).", "parameters": _params({"paths": {"type": "string"}, "confirm": {"type": "boolean"}})},
     {"name": "git_commit", "description": "git commit (confirm=true).", "parameters": _params({"message": {"type": "string"}, "confirm": {"type": "boolean"}}, ["message"])},
+    {"name": "git_push", "description": "Push to origin (confirm=true). Uses GITHUB_TOKEN/GH_TOKEN or credentials.", "parameters": _params({"branch": {"type": "string"}, "set_upstream": {"type": "boolean"}, "confirm": {"type": "boolean"}})},
+    {"name": "git_pull", "description": "git pull --ff-only (confirm=true).", "parameters": _params({"confirm": {"type": "boolean"}})},
+    {"name": "git_remote", "description": "remote list|set-url|add. No tokens in URL.", "parameters": _params({"action": {"type": "string"}, "url": {"type": "string"}, "name": {"type": "string"}})},
+    {"name": "git_init", "description": "git init -b main (confirm=true).", "parameters": _params({"confirm": {"type": "boolean"}})},
     {"name": "jq_filter", "description": "Filter JSON with a jq expression.", "parameters": _params({"data": {"type": "string"}, "expression": {"type": "string"}}, ["data"])},
     {"name": "memory_read", "description": "Read notes memory.", "parameters": _params({})},
     {"name": "memory_write", "description": "Append notes memory.", "parameters": _params({"text": {"type": "string"}}, ["text"])},
@@ -1621,7 +1831,7 @@ def classify_network_error(exc: BaseException) -> str:
 
 def _gemini_post_once(url, body, headers):
     if USE_HTTPX:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
             r = client.post(url, json=body, headers=headers)
             if r.status_code >= 400:
                 try:
@@ -1716,10 +1926,11 @@ def gemini_stream_text(api_key, model, contents, system_instruction=None):
             tx = tx.decode("utf-8", errors="replace")
         tx = redact_secrets(tx)
         print(tx, end="", flush=True)
+        ui_emit("stream_token", tx)
         full.append(tx)
 
     if USE_HTTPX:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
             with client.stream("POST", url, json=body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     body_err = resp.read().decode("utf-8", errors="replace")
@@ -1815,7 +2026,21 @@ def network_reachable(timeout: float = 3.0) -> bool:
         return False
 
 
-def build_system(brain=None):
+def build_system(brain=None, force: bool = False):
+    cache_key = None
+    try:
+        cache_key = (
+            get_pref("user_name"),
+            get_pref("agent_name"),
+            str(Path.cwd()),
+            getattr(brain, "version_token", None) or (
+                len(brain.read_soul()) if brain else 0
+            ),
+        )
+        if not force and _SYSTEM_CACHE.get("key") == cache_key and _SYSTEM_CACHE.get("text"):
+            return _SYSTEM_CACHE["text"]
+    except Exception:
+        pass
     mem = memory_read()
     mem_block = ("\n\nUser memory:\n" + mem[:3000] + "\n") if mem else ""
     brain_block = ""
@@ -1840,6 +2065,7 @@ def build_system(brain=None):
         "Never git init or git add in $HOME or storage shared root.",
         "Never git add .env, .ssh, tokens, credentials, or whole Termux config.",
         "Prefer few precise shell commands over many exploratory ones.",
+"Git: cd project, git_status, git_add, git_commit confirm=true, git_push confirm=true. Auth via GITHUB_TOKEN/GH_TOKEN env, never print token or put it in URL.",
         "If git asks for credentials, stop and tell the user to run git push themselves with a PAT.",
         "Do not loop on the same failing command more than twice; explain the fix instead.",
 "Never print API keys, GitHub PATs, or passwords. If the user pastes command output, reply once with a short summary — do not celebrate each line.",
@@ -1854,7 +2080,13 @@ def build_system(brain=None):
             proj = "\n\n## Project instructions\n" + instr[:6000]
     except Exception:
         pass
-    return " ".join(parts) + mem_block + brain_block + proj
+    out = " ".join(parts) + mem_block + brain_block + proj
+    try:
+        _SYSTEM_CACHE["key"] = cache_key
+        _SYSTEM_CACHE["text"] = out
+    except Exception:
+        pass
+    return out
 
 
 def _parts_have_function_call(parts) -> bool:
@@ -1974,7 +2206,7 @@ def _turn_brief(item: dict, limit: int = 200) -> str:
     return f"{role}: {text}" if text else ""
 
 
-def compact_history(history: list, keep_last: int = 12) -> list:
+def compact_history(history: list, keep_last: int = 10) -> list:
     h = sanitize_history(history)
     if len(h) <= keep_last + 2:
         return h
@@ -2018,25 +2250,14 @@ def _pt_history():
 
 
 def _input_with_timeout(prompt: str, timeout: float):
-    # prompt_toolkit path (better editing/history). Timeout approximated with select first.
-    if USE_PROMPT_TOOLKIT and sys.stdin.isatty():
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        except (ValueError, OSError):
-            ready = True
-        if not ready:
-            print(flush=True)
-            return None
-        try:
-            # strip ANSI for prompt_toolkit
-            plain = re.sub(r"\033\[[0-9;]*m", "", prompt)
-            text = pt_prompt(plain, history=_pt_history())
-            return text
-        except (EOFError, KeyboardInterrupt):
-            raise
-        except Exception:
-            pass  # fall back to classic input
+    """
+    Read user input once (no double echo).
+    Avoid combining select()+prompt_toolkit on the same stdin — that
+    causes duplicated/garbled lines on Termux.
+    """
+    plain = re.sub(r"\033\[[0-9;]*m", "", prompt)
 
+    # Classic path with timeout + multi-line paste batching (most reliable on Termux)
     print(prompt, end="", flush=True)
     try:
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -2045,14 +2266,28 @@ def _input_with_timeout(prompt: str, timeout: float):
             return input()
         except (EOFError, KeyboardInterrupt):
             raise
-    if ready:
-        line = sys.stdin.readline()
-        if line == "":
-            raise EOFError
-        line = line.rstrip("\n")
-        return _drain_stdin_lines(line)
-    print(flush=True)
-    return None
+    if not ready:
+        print(flush=True)
+        return None
+    line = sys.stdin.readline()
+    if line == "":
+        raise EOFError
+    line = line.rstrip("\n")
+    text = _drain_stdin_lines(line)
+    # Deduplicate accidental double paste (same text twice concatenated)
+    if text and len(text) >= 20:
+        half = len(text) // 2
+        a, b = text[:half], text[half:]
+        # exact duplicate
+        if text[: len(text) // 2] == text[len(text) // 2 :]:
+            text = text[: len(text) // 2]
+        else:
+            # almost-duplicate: message ends with a copy of itself
+            for n in range(min(len(text) // 2, 400), 15, -1):
+                if text.endswith(text[:n]) and text.count(text[:n]) >= 2:
+                    text = text[:n]
+                    break
+    return text
 
 
 def proactive_open_line(brain, history) -> str:
@@ -2075,6 +2310,39 @@ def proactive_open_line(brain, history) -> str:
 
 
 
+
+
+_TURN_COUNTER = 0
+
+def _maybe_gc():
+    global _TURN_COUNTER
+    _TURN_COUNTER += 1
+    if _TURN_COUNTER % 5 == 0:
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+def print_status_line(model: str, brain=None) -> None:
+    """Compact status under the reply."""
+    try:
+        cwd = str(Path.cwd())
+        if len(cwd) > 40:
+            cwd = "…" + cwd[-39:]
+    except Exception:
+        cwd = "?"
+    bits = [f"model:{model}", f"cwd:{cwd}"]
+    try:
+        if which("git"):
+            r = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=5, cwd=os.getcwd(),
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                bits.append(f"git:{r.stdout.strip()}")
+    except Exception:
+        pass
+    cprint("  · " + " · ".join(bits), C.DIM)
 
 def print_banner(model: str) -> None:
     """Startup banner with colored ASCII."""
@@ -2246,6 +2514,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                                 brain.save()
                             except Exception:
                                 pass
+                            print_status_line(model, brain)
                             return
                         print()
                     except Exception as ex:
@@ -2253,8 +2522,10 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
 
             for _ in range(40):
                 cprint("... thinking", C.DIM)
-                if len(history) > 16:
-                    history[:] = compact_history(history, keep_last=12)
+                if len(history) > 14:
+                    history[:] = compact_history(history, keep_last=10)
+                if len(history) > 28:
+                    history[:] = compact_history(history, keep_last=8)
                 api_hist = ensure_api_history(history)
                 try:
                     resp = gemini_generate(api_key, model, api_hist, system)
@@ -2275,6 +2546,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                     history.append({"role": "model", "parts": parts})
                     if text:
                         print_assistant(text)
+                        print_status_line(model, brain)
                     break
                 history.append({"role": "model", "parts": parts})
                 fn_responses = []
@@ -2306,8 +2578,8 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                         result = f"Tool error: {tool_ex}"
                     if not isinstance(result, (str, dict, list, int, float, bool)):
                         result = str(result)
-                    if isinstance(result, str) and len(result) > 12000:
-                        result = result[:12000] + "\n...[truncated]"
+                    if isinstance(result, str) and len(result) > 8000:
+                        result = result[:8000] + "\n...[truncated]"
                     fn_responses.append(
                         {"functionResponse": {"name": name, "response": {"result": result}}}
                     )
@@ -2366,6 +2638,7 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
                 "  /clear             Clear chat + screen\n"
                 "  /model [name]      Show/set model\n"
                 "  /config            Settings (name, key, model)\n"
+                "  /git               Git status / quick help\n"
                 "  /image <path> [q]  Analyze image\n"
                 "  /proyecto          Project summary\n"
                 "  /compact           Compact history\n"
@@ -2444,6 +2717,30 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
             except Exception as e:
                 print(e)
             continue
+        if low == "/git" or low.startswith("/git "):
+            sub = user_input[4:].strip().lower()
+            if not sub or sub in ("status", "st"):
+                print(tool_git_status())
+            elif sub in ("diff", "d"):
+                print(tool_git_diff(False))
+            elif sub in ("log", "l"):
+                print(tool_git_log(10))
+            elif sub.startswith("commit "):
+                msg = user_input.split(None, 2)
+                if len(msg) < 3:
+                    cprint("Usage: /git commit <message>", C.YELLOW)
+                else:
+                    print(tool_git_commit(msg[2], confirm=True))
+            else:
+                print(
+                    "Git shortcuts:\n"
+                    "  /git status\n"
+                    "  /git diff\n"
+                    "  /git log\n"
+                    "  /git commit <message>\n"
+                    "Tip: cd into the project folder first. Never git from $HOME.\n"
+                )
+            continue
         if low == "/config" or low.startswith("/config "):
             rest = user_input[7:].strip() if len(user_input) > 7 else ""
             model_ref = _API_KEY_REF
@@ -2507,13 +2804,15 @@ def run_agent(api_key, model, seed_prompt=None, use_stream=True):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Orion Code 3.8.0 (Termux)")
+    parser = argparse.ArgumentParser(description="Orion Code 3.13")
     parser.add_argument("-m", "--model", default=None)
     parser.add_argument("-p", "--prompt", default=None)
     parser.add_argument("--no-stream", action="store_true")
-    parser.add_argument("--version", action="version", version="3.8.0")
+    parser.add_argument("--cli", action="store_true", help="Classic line UI")
+    parser.add_argument("--tui", action="store_true", help="Textual full-screen UI")
+    parser.add_argument("--version", action="version", version="3.13.0")
     args = parser.parse_args()
-    cprint("Orion Code 3.8.0", C.BOLD)
+
     api_key = load_api_key()
     model = args.model or load_saved_model(DEFAULT_MODEL)
     if args.model:
@@ -2524,7 +2823,32 @@ def main():
             prompt = sys.stdin.read().strip() or None
         except Exception:
             prompt = None
-    run_agent(api_key, model, seed_prompt=prompt, use_stream=not args.no_stream)
+
+    # One-shot prompt always classic
+    if prompt:
+        cprint("Orion Code 3.13", C.BOLD)
+        run_agent(api_key, model, seed_prompt=prompt, use_stream=not args.no_stream)
+        return
+
+    want_tui = args.tui or (not args.cli and os.environ.get("ORION_UI", "").lower() in ("tui", "textual", "1", "true"))
+    # Default: TUI if Textual installed and interactive tty, unless --cli
+    if not args.cli and not args.tui and not want_tui:
+        try:
+            import textual  # noqa: F401
+            want_tui = sys.stdin.isatty()
+        except ImportError:
+            want_tui = False
+
+    if want_tui and not args.cli:
+        try:
+            from orion_tui import main as tui_main
+            tui_main(api_key, model)
+            return
+        except Exception as ex:
+            cprint(f"TUI unavailable ({ex}); using classic UI.", C.YELLOW)
+
+    cprint("Orion Code 3.13", C.BOLD)
+    run_agent(api_key, model, seed_prompt=None, use_stream=not args.no_stream)
 
 
 if __name__ == "__main__":

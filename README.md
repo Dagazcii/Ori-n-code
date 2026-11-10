@@ -2,33 +2,30 @@
 
 Terminal agent for Termux using the Gemini API.
 
-## Features
+## UI modes
 
-- File, shell, git, and project tools
-- `@path` file mentions
-- `ORION.md` / `GEMINI.md` project instructions
-- Session restore, history compaction
-- Optional: `requests`, `tenacity`, `rich`
+- **TUI (default if Textual is installed):** full-screen client
+  ```bash
+  orion
+  orion --tui
+  ```
+- **Classic line mode:**
+  ```bash
+  orion --cli
+  ```
 
 ## Install (Termux)
 
 ```bash
 pkg install python git
-pip install requests tenacity rich
+pip install -r requirements.txt
 bash install.sh
 orion
 ```
 
-Set `GEMINI_API_KEY` or enter it on first launch.
+## Commands
 
-## Usage
-
-```text
-orion
-explica @main.py
-/proyecto
-/
-```
+`/config` `/git` `/proyecto` `@file` `/` help · in TUI: `F1` help, `Ctrl+C` quit
 
 ## License
 
